@@ -27,10 +27,10 @@ app.use(express.json({ limit: "256kb" }));
 const samples = {};
 
 // MySQL config (set these env vars on Railway to enable DB mode)
-const MYSQL_HOST = process.env.MYSQL_HOST;
-const MYSQL_USER = process.env.MYSQL_USER;
-const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD;
-const MYSQL_DATABASE = process.env.MYSQL_DATABASE;
+const MYSQL_HOST = process.env.MYSQL_HOST || process.env.MYSQLHOST;
+const MYSQL_USER = process.env.MYSQL_USER || process.env.MYSQLUSER;
+const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || process.env.MYSQLPASSWORD;
+const MYSQL_DATABASE = process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE;
 const USE_DB = !!(MYSQL_HOST && MYSQL_USER && MYSQL_PASSWORD && MYSQL_DATABASE);
 let dbPool = null;
 
