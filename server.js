@@ -23,8 +23,10 @@ app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
 // In-memory sample store keyed by userKey:
-// { [userKey]: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] } } }
+// { [userKey]: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 } }
 const samples = {};
+const controlStates = {};
+const controlCommands = {};
 
 // MySQL config (set these env vars on Railway to enable DB mode)
 const MYSQL_HOST = process.env.MYSQL_HOST || process.env.MYSQLHOST;
@@ -49,6 +51,9 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB;
   `);
+  await dbPool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_honey BIGINT DEFAULT 0`);
+  await dbPool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity INT DEFAULT 0`);
+  await dbPool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_honey BIGINT DEFAULT 0`);
   await dbPool.query(`
     CREATE TABLE IF NOT EXISTS samples (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -149,7 +154,8 @@ function getBucket(userKey) {
         gather: [],
         token: [],
         other: []
-      }
+      },
+      currentHoney: 0
     };
   }
   return samples[userKey];
@@ -180,7 +186,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       const arr = bucket.sources[src].filter(p => p.t >= cutoff);
       sources[src] = arr.reduce((a,b)=>a+(b.v||0),0);
     }
-    res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources: sources });
+    res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources: sources, honeySourcesTotals: sources, currentHoney: bucket.currentHoney || 0 });
   };
 
   if (!USE_DB) return respondFromMemory();
@@ -224,7 +230,9 @@ app.get("/api/stats", requireReadKey, (req, res) => {
           honeySourcesTotals[row.src] += row.v || 0;
         }
       }
-      res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources, honeySourcesTotals });
+      const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
+      const currentHoney = userRows && userRows[0] ? userRows[0].current_honey || 0 : 0;
+      res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources, honeySourcesTotals, currentHoney });
     } catch (err) {
       console.error(err);
       respondFromMemory();
@@ -234,12 +242,13 @@ app.get("/api/stats", requireReadKey, (req, res) => {
 
 // POST ingest
 app.post("/api/ingest", requireWriteKey, (req, res) => {
-  const { honey, pollen, at, tokens, buffs, honeySources } = req.body || {};
+  const { honey, pollen, at, tokens, buffs, honeySources, currentHoney } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
 
   if (
     typeof honey !== "number" &&
     typeof pollen !== "number" &&
+    typeof currentHoney !== "number" &&
     !Array.isArray(tokens) &&
     typeof buffs !== "object" &&
     typeof honeySources !== "object"
@@ -281,6 +290,9 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
           bucket.sources[src] = bucket.sources[src].slice(-400);
         }
       });
+    }
+    if (typeof currentHoney === "number") {
+      bucket.currentHoney = currentHoney;
     }
     const cutoff = nowSec() - 86400 * 30;
     bucket.honey = bucket.honey.filter((p) => p.t >= cutoff);
@@ -345,6 +357,12 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
           await dbPool.query("INSERT INTO honey_sources (user_key, src, t, v) VALUES ?", [srcRows]);
         }
       }
+      if (typeof currentHoney === "number") {
+        await dbPool.query(
+          "UPDATE users SET current_honey = ?, last_activity = ? WHERE user_key = ?",
+          [currentHoney, t, req.userKey]
+        );
+      }
       res.json({ ok: true, mode: "mysql" });
     } catch (err) {
       console.error(err);
@@ -352,6 +370,39 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
       res.json({ ok: true, mode: "memory-fallback" });
     }
   })();
+});
+
+// Control sync endpoints (in-memory)
+app.post("/api/controls/state", requireWriteKey, (req, res) => {
+  const state = req.body && req.body.state;
+  const at = req.body && req.body.at;
+  if (!state) {
+    return res.status(400).json({ error: "state required" });
+  }
+  controlStates[req.userKey] = { state, at: typeof at === "number" ? at : nowSec() };
+  res.json({ ok: true });
+});
+
+app.get("/api/controls/state", requireReadKey, (req, res) => {
+  const entry = controlStates[req.userKey];
+  res.json(entry || { state: null });
+});
+
+app.post("/api/controls/commands", requireReadKey, (req, res) => {
+  const cmds = Array.isArray(req.body && req.body.commands) ? req.body.commands : null;
+  if (!cmds || !cmds.length) {
+    return res.status(400).json({ error: "commands array required" });
+  }
+  if (!controlCommands[req.userKey]) controlCommands[req.userKey] = [];
+  const stamped = cmds.map((c) => ({ ...c, at: nowSec() }));
+  controlCommands[req.userKey].push(...stamped);
+  res.json({ ok: true, queued: controlCommands[req.userKey].length });
+});
+
+app.get("/api/controls/commands", requireWriteKey, (req, res) => {
+  const list = controlCommands[req.userKey] || [];
+  controlCommands[req.userKey] = [];
+  res.json({ commands: list });
 });
 
 (async () => {
