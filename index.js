@@ -215,22 +215,3 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     console.log(`Bee stats backend listening on :${PORT} (${USE_DB ? "mysql" : "memory"})`);
   });
 })();
-    samples.honey.push({ t, v: honey });
-  }
-  if (typeof pollen === "number" && isFinite(pollen)) {
-    samples.pollen.push({ t, v: pollen });
-  }
-
-  // Keep only 30 days of data in memory
-  const cutoff = nowSec() - 86400 * 30;
-  samples.honey = samples.honey.filter((p) => p.t >= cutoff);
-  samples.pollen = samples.pollen.filter((p) => p.t >= cutoff);
-
-  res.json({ ok: true });
-});
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.listen(PORT, () => {
-  console.log(`Bee stats backend listening on :${PORT}`);
-});
