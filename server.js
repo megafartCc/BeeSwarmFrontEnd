@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
 // In-memory sample store keyed by userKey:
-// { [userKey]: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] } } }
+// { [userKey]: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] } } }
 const samples = {};
 
 // MySQL config (set these env vars on Railway to enable DB mode)
@@ -81,6 +81,17 @@ async function initDb() {
       FOREIGN KEY (user_key) REFERENCES users(user_key) ON DELETE CASCADE
     ) ENGINE=InnoDB;
   `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS honey_sources (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      user_key VARCHAR(128) NOT NULL,
+      src ENUM('convert','gather','token','other') NOT NULL,
+      t INT NOT NULL,
+      v DOUBLE NOT NULL,
+      INDEX idx_src_user_time (user_key, src, t),
+      FOREIGN KEY (user_key) REFERENCES users(user_key) ON DELETE CASCADE
+    ) ENGINE=InnoDB;
+  `);
 }
 
 // Helpers
@@ -128,7 +139,18 @@ const requireWriteKey = (req, res, next) => {
 
 function getBucket(userKey) {
   if (!samples[userKey]) {
-    samples[userKey] = { honey: [], pollen: [], tokens: [], buffs: {} };
+    samples[userKey] = {
+      honey: [],
+      pollen: [],
+      tokens: [],
+      buffs: {},
+      sources: {
+        convert: [],
+        gather: [],
+        token: [],
+        other: []
+      }
+    };
   }
   return samples[userKey];
 }
@@ -152,7 +174,13 @@ app.get("/api/stats", requireReadKey, (req, res) => {
     for (const name in bucket.buffs) {
       buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff).slice(-200);
     }
-    res.json({ honey, pollen, tokens, buffs });
+    const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
+    const sources = { convert: 0, gather: 0, token: 0, other: 0 };
+    for (const src in bucket.sources) {
+      const arr = bucket.sources[src].filter(p => p.t >= cutoff);
+      sources[src] = arr.reduce((a,b)=>a+(b.v||0),0);
+    }
+    res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources: sources });
   };
 
   if (!USE_DB) return respondFromMemory();
@@ -171,6 +199,10 @@ app.get("/api/stats", requireReadKey, (req, res) => {
         "SELECT name, t, v FROM buffs WHERE user_key = ? AND t >= ? ORDER BY t ASC LIMIT 1000",
         [req.userKey, cutoff]
       );
+      const [srcRows] = await dbPool.query(
+        "SELECT src, t, v FROM honey_sources WHERE user_key = ? AND t >= ? ORDER BY t ASC LIMIT 2000",
+        [req.userKey, cutoff]
+      );
       const honey = [];
       const pollen = [];
       for (const row of rows) {
@@ -183,7 +215,16 @@ app.get("/api/stats", requireReadKey, (req, res) => {
         buffs[row.name] = buffs[row.name] || [];
         buffs[row.name].push({ t: row.t, v: row.v });
       }
-      res.json({ honey, pollen, tokens, buffs });
+      const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
+      const honeySources = { convert: [], gather: [], token: [], other: [] };
+      const honeySourcesTotals = { convert: 0, gather: 0, token: 0, other: 0 };
+      for (const row of srcRows) {
+        if (honeySources[row.src]) {
+          honeySources[row.src].push({ t: row.t, v: row.v });
+          honeySourcesTotals[row.src] += row.v || 0;
+        }
+      }
+      res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources, honeySourcesTotals });
     } catch (err) {
       console.error(err);
       respondFromMemory();
@@ -193,14 +234,15 @@ app.get("/api/stats", requireReadKey, (req, res) => {
 
 // POST ingest
 app.post("/api/ingest", requireWriteKey, (req, res) => {
-  const { honey, pollen, at, tokens, buffs } = req.body || {};
+  const { honey, pollen, at, tokens, buffs, honeySources } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
 
   if (
     typeof honey !== "number" &&
     typeof pollen !== "number" &&
     !Array.isArray(tokens) &&
-    typeof buffs !== "object"
+    typeof buffs !== "object" &&
+    typeof honeySources !== "object"
   ) {
     return res.status(400).json({ error: "no metrics provided" });
   }
@@ -231,12 +273,24 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
         }
       }
     }
+    if (honeySources && typeof honeySources === "object") {
+      const srcs = ["convert","gather","token","other"];
+      srcs.forEach(src => {
+        if (typeof honeySources[src] === "number") {
+          bucket.sources[src].push({ t, v: honeySources[src] });
+          bucket.sources[src] = bucket.sources[src].slice(-400);
+        }
+      });
+    }
     const cutoff = nowSec() - 86400 * 30;
     bucket.honey = bucket.honey.filter((p) => p.t >= cutoff);
     bucket.pollen = bucket.pollen.filter((p) => p.t >= cutoff);
     bucket.tokens = bucket.tokens.filter((p) => p.t >= cutoff);
     for (const name in bucket.buffs) {
       bucket.buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff);
+    }
+    for (const src in bucket.sources) {
+      bucket.sources[src] = bucket.sources[src].filter((p) => p.t >= cutoff);
     }
   };
 
@@ -277,6 +331,18 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
         }
         if (buffRows.length) {
           await dbPool.query("INSERT INTO buffs (user_key, name, t, v) VALUES ?", [buffRows]);
+        }
+      }
+      if (honeySources && typeof honeySources === "object") {
+        const srcRows = [];
+        ["convert","gather","token","other"].forEach(src => {
+          const val = honeySources[src];
+          if (typeof val === "number") {
+            srcRows.push([req.userKey, src, t, val]);
+          }
+        });
+        if (srcRows.length) {
+          await dbPool.query("INSERT INTO honey_sources (user_key, src, t, v) VALUES ?", [srcRows]);
         }
       }
       res.json({ ok: true, mode: "mysql" });
