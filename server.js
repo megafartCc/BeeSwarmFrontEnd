@@ -26,8 +26,6 @@ app.use(express.json({ limit: "256kb" }));
 // In-memory sample store keyed by userKey:
 // { [userKey]: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 } }
 const samples = {};
-const controlStates = {};
-const controlCommands = {};
 const pushSockets = new Map(); // userKey -> ws (script)
 const subSockets = new Map();  // userKey -> Set<ws> (frontend)
 const controlStates = {};
