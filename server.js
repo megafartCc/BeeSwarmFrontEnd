@@ -13,7 +13,6 @@
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
-const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "replace-this-api-key";          // used by your script to push samples
@@ -23,11 +22,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
-// In-memory sample store keyed by userKey:
-// { [userKey]: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 } }
+// In-memory stores keyed by userKey:
+// samples: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 }
+// controlStates: { state, at }
+// controlCommands: [ {command, at} ]
 const samples = {};
-const pushSockets = new Map(); // userKey -> ws (script)
-const subSockets = new Map();  // userKey -> Set<ws> (frontend)
 const controlStates = {};
 const controlCommands = {};
 
@@ -379,7 +378,6 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
 });
 
 // Control sync endpoints (in-memory)
-// HTTP fallback for controls (kept for compatibility)
 app.post("/api/controls/state", requireWriteKey, (req, res) => {
   const state = req.body && req.body.state;
   const at = req.body && req.body.at;
@@ -387,12 +385,6 @@ app.post("/api/controls/state", requireWriteKey, (req, res) => {
     return res.status(400).json({ error: "state required" });
   }
   controlStates[req.userKey] = { state, at: typeof at === "number" ? at : nowSec() };
-  // Fan out to any WebSocket subscribers
-  const subs = subSockets.get(req.userKey);
-  if (subs) {
-    const msg = JSON.stringify({ type: "state", state, at: controlStates[req.userKey].at });
-    subs.forEach((ws) => { if (ws.readyState === WebSocket.OPEN) ws.send(msg); });
-  }
   res.json({ ok: true });
 });
 
@@ -409,10 +401,9 @@ app.post("/api/controls/commands", requireReadKey, (req, res) => {
   if (!controlCommands[req.userKey]) controlCommands[req.userKey] = [];
   const stamped = cmds.map((c) => ({ ...c, at: nowSec() }));
   controlCommands[req.userKey].push(...stamped);
-  // Push to websocket client if connected
-  const target = pushSockets.get(req.userKey);
-  if (target && target.readyState === WebSocket.OPEN) {
-    target.send(JSON.stringify({ type: "command", commands: stamped }));
+  // trim to last 100
+  if (controlCommands[req.userKey].length > 100) {
+    controlCommands[req.userKey] = controlCommands[req.userKey].slice(-100);
   }
   res.json({ ok: true, queued: controlCommands[req.userKey].length });
 });
@@ -430,83 +421,7 @@ app.get("/api/controls/commands", requireWriteKey, (req, res) => {
     console.error("DB init failed, falling back to memory:", err.message);
   }
   app.get("/health", (_req, res) => res.json({ ok: true, mode: USE_DB ? "mysql" : "memory" }));
-  const server = app.listen(PORT, () => {
+  app.listen(PORT, () => {
     console.log(`Bee stats backend listening on :${PORT} (${USE_DB ? "mysql" : "memory"})`);
-  });
-
-  // WebSocket bridge for control sync
-  const wss = new WebSocket.Server({ server, path: "/ws/controls" });
-  const normalize = (url) => new URL(url, "http://localhost");
-  wss.on("connection", (ws, req) => {
-    const params = normalize(req.url).searchParams;
-    const mode = params.get("mode");
-    const userKey = params.get("userKey");
-    const apiKey = params.get("apiKey") || req.headers["x-api-key"];
-    const clientKey = params.get("clientKey") || req.headers["x-client-key"];
-    if (!userKey) {
-      ws.close(1008, "x-user-key required");
-      return;
-    }
-    if (mode === "push") {
-      if (apiKey !== API_KEY) {
-        ws.close(1008, "unauthorized");
-        return;
-      }
-      pushSockets.set(userKey, ws);
-      ws.on("message", (data) => {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-        if (msg.type === "state" && msg.state) {
-          const at = typeof msg.at === "number" ? msg.at : nowSec();
-          controlStates[userKey] = { state: msg.state, at };
-          const subs = subSockets.get(userKey);
-          if (subs) {
-            const payload = JSON.stringify({ type: "state", state: msg.state, at });
-            subs.forEach((sock) => { if (sock.readyState === WebSocket.OPEN) sock.send(payload); });
-          }
-        } else if (msg.type === "command" && Array.isArray(msg.commands)) {
-          // Optionally store for HTTP fallback consumers
-          controlCommands[userKey] = controlCommands[userKey] || [];
-          controlCommands[userKey].push(...msg.commands);
-        }
-      });
-      ws.on("close", () => {
-        if (pushSockets.get(userKey) === ws) pushSockets.delete(userKey);
-      });
-    } else if (mode === "sub") {
-      if (CLIENT_KEY && CLIENT_KEY !== "replace-this-client-key" && clientKey !== CLIENT_KEY) {
-        ws.close(1008, "unauthorized");
-        return;
-      }
-      if (!subSockets.has(userKey)) subSockets.set(userKey, new Set());
-      subSockets.get(userKey).add(ws);
-      // send last known state immediately
-      const last = controlStates[userKey];
-      if (last) {
-        ws.send(JSON.stringify({ type: "state", state: last.state, at: last.at }));
-      }
-      ws.on("message", (data) => {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-        if (msg.type === "command" && Array.isArray(msg.commands)) {
-          const target = pushSockets.get(userKey);
-          if (target && target.readyState === WebSocket.OPEN) {
-            target.send(JSON.stringify({ type: "command", commands: msg.commands }));
-          } else {
-            controlCommands[userKey] = controlCommands[userKey] || [];
-            controlCommands[userKey].push(...msg.commands);
-          }
-        }
-      });
-      ws.on("close", () => {
-        const set = subSockets.get(userKey);
-        if (set) {
-          set.delete(ws);
-          if (set.size === 0) subSockets.delete(userKey);
-        }
-      });
-    } else {
-      ws.close(1008, "mode required");
-    }
   });
 })();
