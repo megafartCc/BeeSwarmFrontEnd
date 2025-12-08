@@ -1,15 +1,17 @@
 {
-  "name": "bee-stats-backend",
+  "name": "bee-stats-dashboard",
   "version": "1.0.0",
-  "description": "Bee Swarm Stats Backend",
+  "private": true,
+  "description": "Frontend + backend for Bee Swarm stats (honey/pollen) dashboard",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "mysql2": "^3.9.7",
-    "moment-timezone": "^0.5.45"  <-- MUST BE PRESENT
+    "mysql2": "^3.11.3",
+    "moment-timezone": "^0.5.45" 
   }
 }
