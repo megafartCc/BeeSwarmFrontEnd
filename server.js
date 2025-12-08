@@ -54,9 +54,12 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB;
   `);
-  await dbPool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_honey BIGINT DEFAULT 0`);
-  await dbPool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity INT DEFAULT 0`);
-  await dbPool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_honey BIGINT DEFAULT 0`);
+  const addColumn = async (sql) => {
+    try { await dbPool.query(sql); } catch (e) { if (e && e.code !== "ER_DUP_FIELDNAME") throw e; }
+  };
+  await addColumn(`ALTER TABLE users ADD COLUMN total_honey BIGINT DEFAULT 0`);
+  await addColumn(`ALTER TABLE users ADD COLUMN last_activity INT DEFAULT 0`);
+  await addColumn(`ALTER TABLE users ADD COLUMN current_honey BIGINT DEFAULT 0`);
   await dbPool.query(`
     CREATE TABLE IF NOT EXISTS samples (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
