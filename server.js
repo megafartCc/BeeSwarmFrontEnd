@@ -390,7 +390,11 @@ app.post("/api/controls/state", requireWriteKey, (req, res) => {
 
 app.get("/api/controls/state", requireReadKey, (req, res) => {
   const entry = controlStates[req.userKey];
-  res.json(entry || { state: null });
+  if (entry) {
+    res.json({ state: entry.state, at: entry.at || nowSec() });
+  } else {
+    res.json({ state: null, at: nowSec() });
+  }
 });
 
 app.post("/api/controls/commands", requireReadKey, (req, res) => {
