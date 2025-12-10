@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
 // In-memory stores keyed by userKey:
-// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], other: [] }, currentHoney: 0 }
+// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, currentHoney: 0 }
 // controlStates: { state, at }
 // controlCommands: [ {command, at} ]
 const samples = {};
@@ -97,17 +97,6 @@ async function initDb() {
       FOREIGN KEY (user_key) REFERENCES users(user_key) ON DELETE CASCADE
     ) ENGINE=InnoDB;
   `);
-  await dbPool.query(`
-    CREATE TABLE IF NOT EXISTS honey_sources (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      user_key VARCHAR(128) NOT NULL,
-      src ENUM('convert','gather','token','other') NOT NULL,
-      t INT NOT NULL,
-      v DOUBLE NOT NULL,
-      INDEX idx_src_user_time (user_key, src, t),
-      FOREIGN KEY (user_key) REFERENCES users(user_key) ON DELETE CASCADE
-    ) ENGINE=InnoDB;
-  `);
 }
 
 // Helpers
@@ -161,11 +150,6 @@ function getBucket(userKey) {
       backpack: [],
       tokens: [],
       buffs: {},
-      sources: {
-        convert: [],
-        gather: [],
-        other: []
-      },
       currentHoney: 0
     };
   }
@@ -182,25 +166,6 @@ app.get("/api/stats", requireReadKey, (req, res) => {
   const periodSec = toSeconds(req.query.period || "24h");
   const cutoff = nowSec() - periodSec;
 
-  const aggregateSources = (srcMap, cutoffSec, nowSecVal) => {
-    const resMap = { convert: [], gather: [], other: [] };
-    const totals = { convert: 0, gather: 0, other: 0 };
-    let lastSampleAt = 0;
-    for (const src in srcMap) {
-      const target = src === "token" ? "other" : (resMap[src] ? src : "other");
-      const arr = srcMap[src] || [];
-      arr.forEach((p) => {
-        if (!p || typeof p.t !== "number") return;
-        lastSampleAt = Math.max(lastSampleAt, p.t);
-        if (p.t >= cutoffSec) {
-          resMap[target].push({ t: p.t, v: p.v });
-          totals[target] += p.v || 0;
-        }
-      });
-    }
-    return { resMap, totals, lastSampleAt };
-  };
-
   const respondFromMemory = () => {
     const bucket = getBucket(req.userKey);
     const honey = bucket.honey.filter((p) => p.t >= cutoff);
@@ -213,30 +178,6 @@ app.get("/api/stats", requireReadKey, (req, res) => {
     }
     const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
     const tokenCountsAll = (bucket.tokens || []).reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
-
-    // Primary: requested window
-    const { resMap: honeySources, totals: honeySourcesTotals, lastSampleAt } = aggregateSources(bucket.sources, cutoff, nowSec());
-    let usedRangeSec = toSeconds(req.query.period || "24h");
-
-    // Fallback: if empty, use 24h of data to keep chart alive
-    const totalVal = honeySourcesTotals.convert + honeySourcesTotals.gather + honeySourcesTotals.other;
-    let honeySourcesMeta = { usedRangeSec, fallback: false, lastSampleAt: lastSampleAt || 0 };
-    if (totalVal <= 0) {
-      const dayCut = nowSec() - 86400;
-      const fallback = aggregateSources(bucket.sources, dayCut, nowSec());
-      const fbTotal = fallback.totals.convert + fallback.totals.gather + fallback.totals.other;
-      if (fbTotal > 0) {
-        honeySources.convert = fallback.resMap.convert;
-        honeySources.gather = fallback.resMap.gather;
-        honeySources.other = fallback.resMap.other;
-        honeySourcesTotals.convert = fallback.totals.convert;
-        honeySourcesTotals.gather = fallback.totals.gather;
-        honeySourcesTotals.other = fallback.totals.other;
-        usedRangeSec = 86400;
-        honeySourcesMeta = { usedRangeSec, fallback: true, lastSampleAt: fallback.lastSampleAt || lastSampleAt || 0 };
-      }
-    }
-
     res.json({
       honey,
       pollen,
@@ -245,9 +186,6 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       tokenCounts,
       tokenCountsAll,
       buffs,
-      honeySources,
-      honeySourcesTotals,
-      honeySourcesMeta,
       currentHoney: bucket.currentHoney || 0
     });
   };
@@ -272,11 +210,6 @@ app.get("/api/stats", requireReadKey, (req, res) => {
         "SELECT name, t, v FROM buffs WHERE user_key = ? AND t >= ? ORDER BY t ASC LIMIT 1000",
         [req.userKey, cutoff]
       );
-      const fullCutoff = nowSec() - (86400 * 30);
-      const [srcRows] = await dbPool.query(
-        "SELECT src, t, v FROM honey_sources WHERE user_key = ? AND t >= ? ORDER BY t ASC LIMIT 2000",
-        [req.userKey, fullCutoff]
-      );
       const honey = [];
       const pollen = [];
       const backpack = [];
@@ -296,42 +229,9 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       for (const row of tokenTotalRows) {
         tokenCountsAll[row.token] = row.cnt;
       }
-      const honeySources = { convert: [], gather: [], other: [] };
-      const honeySourcesTotals = { convert: 0, gather: 0, other: 0 };
-      const fallbackTotals = { convert: 0, gather: 0, other: 0 };
-      let lastSampleAt = 0;
-      const addRow = (row, useFallback) => {
-        const target = row.src === "token" ? "other" : row.src;
-        if (honeySources[target]) {
-          if (!useFallback && row.t >= cutoff) {
-            honeySources[target].push({ t: row.t, v: row.v });
-            honeySourcesTotals[target] += row.v || 0;
-          }
-          fallbackTotals[target] += row.v || 0;
-          lastSampleAt = Math.max(lastSampleAt, row.t || 0);
-        }
-      };
-      for (const row of srcRows) addRow(row, false);
-
-      let usedRangeSec = toSeconds(req.query.period || "24h");
-      let honeySourcesMeta = { usedRangeSec, fallback: false, lastSampleAt };
-      const totalVal = honeySourcesTotals.convert + honeySourcesTotals.gather + honeySourcesTotals.other;
-      if (totalVal <= 0) {
-        honeySourcesTotals.convert = fallbackTotals.convert;
-        honeySourcesTotals.gather = fallbackTotals.gather;
-        honeySourcesTotals.other = fallbackTotals.other;
-        for (const row of srcRows) {
-          const target = row.src === "token" ? "other" : row.src;
-          if (honeySources[target]) {
-            honeySources[target].push({ t: row.t, v: row.v });
-          }
-        }
-        usedRangeSec = 86400;
-        honeySourcesMeta = { usedRangeSec, fallback: true, lastSampleAt };
-      }
       const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
       const currentHoney = userRows && userRows[0] ? userRows[0].current_honey || 0 : 0;
-      res.json({ honey, pollen, backpack, tokens, tokenCounts, tokenCountsAll, buffs, honeySources, honeySourcesTotals, honeySourcesMeta, currentHoney });
+      res.json({ honey, pollen, backpack, tokens, tokenCounts, tokenCountsAll, buffs, currentHoney });
     } catch (err) {
       console.error(err);
       respondFromMemory();
@@ -341,7 +241,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
 
 // POST ingest
 app.post("/api/ingest", requireWriteKey, (req, res) => {
-  const { honey, pollen, backpack, at, tokens, buffs, honeySources, currentHoney } = req.body || {};
+  const { honey, pollen, backpack, at, tokens, buffs, currentHoney } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
 
   if (
@@ -350,8 +250,7 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     typeof backpack !== "number" &&
     typeof currentHoney !== "number" &&
     !Array.isArray(tokens) &&
-    typeof buffs !== "object" &&
-    typeof honeySources !== "object"
+    typeof buffs !== "object"
   ) {
     return res.status(400).json({ error: "no metrics provided" });
   }
@@ -385,16 +284,6 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
         }
       }
     }
-    if (honeySources && typeof honeySources === "object") {
-      const srcs = ["convert","gather","token","other"];
-      srcs.forEach(src => {
-        if (typeof honeySources[src] === "number") {
-          const target = src === "token" ? "other" : src;
-          bucket.sources[target].push({ t, v: honeySources[src] });
-          bucket.sources[target] = bucket.sources[target].slice(-400);
-        }
-      });
-    }
     if (typeof currentHoney === "number") {
       bucket.currentHoney = currentHoney;
     }
@@ -405,9 +294,6 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     bucket.tokens = bucket.tokens.filter((p) => p.t >= cutoff);
     for (const name in bucket.buffs) {
       bucket.buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff);
-    }
-    for (const src in bucket.sources) {
-      bucket.sources[src] = bucket.sources[src].filter((p) => p.t >= cutoff);
     }
   };
 
@@ -451,19 +337,6 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
         }
         if (buffRows.length) {
           await dbPool.query("INSERT INTO buffs (user_key, name, t, v) VALUES ?", [buffRows]);
-        }
-      }
-      if (honeySources && typeof honeySources === "object") {
-        const srcRows = [];
-        ["convert","gather","token","other"].forEach(src => {
-          const val = honeySources[src];
-          if (typeof val === "number") {
-            const target = src === "token" ? "other" : src;
-            srcRows.push([req.userKey, target, t, val]);
-          }
-        });
-        if (srcRows.length) {
-          await dbPool.query("INSERT INTO honey_sources (user_key, src, t, v) VALUES ?", [srcRows]);
         }
       }
       if (typeof currentHoney === "number") {
