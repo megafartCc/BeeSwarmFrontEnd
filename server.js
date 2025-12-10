@@ -193,6 +193,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff).slice(-200);
     }
     const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
+    const tokenCountsAll = (bucket.tokens || []).reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
     const honeySources = { convert: [], gather: [], other: [] };
     const honeySourcesTotals = { convert: 0, gather: 0, other: 0 };
     for (const src in bucket.sources) {
@@ -208,6 +209,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       backpack,
       tokens,
       tokenCounts,
+      tokenCountsAll,
       buffs,
       honeySources,
       honeySourcesTotals,
@@ -226,6 +228,10 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       const [tokenRows] = await dbPool.query(
         "SELECT t, token FROM tokens WHERE user_key = ? AND t >= ? ORDER BY t ASC LIMIT 400",
         [req.userKey, cutoff]
+      );
+      const [tokenTotalRows] = await dbPool.query(
+        "SELECT token, COUNT(*) as cnt FROM tokens WHERE user_key = ? GROUP BY token",
+        [req.userKey]
       );
       const [buffRows] = await dbPool.query(
         "SELECT name, t, v FROM buffs WHERE user_key = ? AND t >= ? ORDER BY t ASC LIMIT 1000",
@@ -250,6 +256,10 @@ app.get("/api/stats", requireReadKey, (req, res) => {
         buffs[row.name].push({ t: row.t, v: row.v });
       }
       const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
+      const tokenCountsAll = {};
+      for (const row of tokenTotalRows) {
+        tokenCountsAll[row.token] = row.cnt;
+      }
       const honeySources = { convert: [], gather: [], other: [] };
       const honeySourcesTotals = { convert: 0, gather: 0, other: 0 };
       for (const row of srcRows) {
@@ -261,7 +271,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       }
       const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
       const currentHoney = userRows && userRows[0] ? userRows[0].current_honey || 0 : 0;
-      res.json({ honey, pollen, backpack, tokens, tokenCounts, buffs, honeySources, honeySourcesTotals, currentHoney });
+      res.json({ honey, pollen, backpack, tokens, tokenCounts, tokenCountsAll, buffs, honeySources, honeySourcesTotals, currentHoney });
     } catch (err) {
       console.error(err);
       respondFromMemory();
