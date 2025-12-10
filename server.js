@@ -1,7 +1,7 @@
 // Simple Railway-ready backend for Bee Swarm stats.
 // Endpoints:
-//   GET  /api/stats?period=24h            -> { honey: [{t,v}], pollen: [{t,v}] }
-//   POST /api/ingest (body: {honey, pollen, at?}) with x-api-key header
+//   GET  /api/stats?period=24h            -> { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}] }
+//   POST /api/ingest (body: {honey, pollen, backpack, at?}) with x-api-key header
 //   Both endpoints require x-user-key to scope data per user.
 // Auth:
 //   Read (GET):   x-client-key must match CLIENT_KEY (if set) AND x-user-key present
@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
 // In-memory stores keyed by userKey:
-// samples: { honey: [{t,v}], pollen: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 }
+// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 }
 // controlStates: { state, at }
 // controlCommands: [ {command, at} ]
 const samples = {};
@@ -63,13 +63,19 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS samples (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       user_key VARCHAR(128) NOT NULL,
-      metric ENUM('honey','pollen') NOT NULL,
+      metric ENUM('honey','pollen','backpack') NOT NULL,
       t INT NOT NULL,
       v DOUBLE NOT NULL,
       INDEX idx_user_time (user_key, t),
       FOREIGN KEY (user_key) REFERENCES users(user_key) ON DELETE CASCADE
     ) ENGINE=InnoDB;
   `);
+  // Ensure ENUM includes 'backpack' even if table already existed
+  try {
+    await dbPool.query(`ALTER TABLE samples MODIFY COLUMN metric ENUM('honey','pollen','backpack') NOT NULL`);
+  } catch (e) {
+    // ignore; column may already be in desired shape
+  }
   await dbPool.query(`
     CREATE TABLE IF NOT EXISTS tokens (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -152,6 +158,7 @@ function getBucket(userKey) {
     samples[userKey] = {
       honey: [],
       pollen: [],
+      backpack: [],
       tokens: [],
       buffs: {},
       sources: {
@@ -180,6 +187,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
     const bucket = getBucket(req.userKey);
     const honey = bucket.honey.filter((p) => p.t >= cutoff);
     const pollen = bucket.pollen.filter((p) => p.t >= cutoff);
+    const backpack = bucket.backpack.filter((p) => p.t >= cutoff);
     const tokens = bucket.tokens.filter((p) => p.t >= cutoff).slice(-200);
     const buffs = {};
     for (const name in bucket.buffs) {
@@ -191,7 +199,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       const arr = bucket.sources[src].filter(p => p.t >= cutoff);
       sources[src] = arr.reduce((a,b)=>a+(b.v||0),0);
     }
-    res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources: sources, honeySourcesTotals: sources, currentHoney: bucket.currentHoney || 0 });
+    res.json({ honey, pollen, backpack, tokens, tokenCounts, buffs, honeySources: sources, honeySourcesTotals: sources, currentHoney: bucket.currentHoney || 0 });
   };
 
   if (!USE_DB) return respondFromMemory();
@@ -216,9 +224,11 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       );
       const honey = [];
       const pollen = [];
+      const backpack = [];
       for (const row of rows) {
         if (row.metric === "honey") honey.push({ t: row.t, v: row.v });
         else if (row.metric === "pollen") pollen.push({ t: row.t, v: row.v });
+        else if (row.metric === "backpack") backpack.push({ t: row.t, v: row.v });
       }
       const tokens = tokenRows.map(r => ({ t: r.t, token: r.token }));
       const buffs = {};
@@ -237,7 +247,7 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       }
       const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
       const currentHoney = userRows && userRows[0] ? userRows[0].current_honey || 0 : 0;
-      res.json({ honey, pollen, tokens, tokenCounts, buffs, honeySources, honeySourcesTotals, currentHoney });
+      res.json({ honey, pollen, backpack, tokens, tokenCounts, buffs, honeySources, honeySourcesTotals, currentHoney });
     } catch (err) {
       console.error(err);
       respondFromMemory();
@@ -247,12 +257,13 @@ app.get("/api/stats", requireReadKey, (req, res) => {
 
 // POST ingest
 app.post("/api/ingest", requireWriteKey, (req, res) => {
-  const { honey, pollen, at, tokens, buffs, honeySources, currentHoney } = req.body || {};
+  const { honey, pollen, backpack, at, tokens, buffs, honeySources, currentHoney } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
 
   if (
     typeof honey !== "number" &&
     typeof pollen !== "number" &&
+    typeof backpack !== "number" &&
     typeof currentHoney !== "number" &&
     !Array.isArray(tokens) &&
     typeof buffs !== "object" &&
@@ -268,6 +279,9 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     }
     if (typeof pollen === "number" && isFinite(pollen)) {
       bucket.pollen.push({ t, v: pollen });
+    }
+    if (typeof backpack === "number" && isFinite(backpack)) {
+      bucket.backpack.push({ t, v: backpack });
     }
     if (Array.isArray(tokens)) {
       for (const tok of tokens) {
@@ -302,6 +316,7 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     const cutoff = nowSec() - 86400 * 30;
     bucket.honey = bucket.honey.filter((p) => p.t >= cutoff);
     bucket.pollen = bucket.pollen.filter((p) => p.t >= cutoff);
+    bucket.backpack = bucket.backpack.filter((p) => p.t >= cutoff);
     bucket.tokens = bucket.tokens.filter((p) => p.t >= cutoff);
     for (const name in bucket.buffs) {
       bucket.buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff);
@@ -325,6 +340,9 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
       }
       if (typeof pollen === "number" && isFinite(pollen)) {
         inserts.push(["pollen", t, pollen]);
+      }
+      if (typeof backpack === "number" && isFinite(backpack)) {
+        inserts.push(["backpack", t, backpack]);
       }
       if (inserts.length) {
         await dbPool.query(
