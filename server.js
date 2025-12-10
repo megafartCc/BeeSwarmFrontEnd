@@ -194,12 +194,26 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff).slice(-200);
     }
     const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
-    const sources = { convert: 0, gather: 0, token: 0, other: 0 };
+    const honeySources = { convert: [], gather: [], token: [], other: [] };
+    const honeySourcesTotals = { convert: 0, gather: 0, token: 0, other: 0 };
     for (const src in bucket.sources) {
-      const arr = bucket.sources[src].filter(p => p.t >= cutoff);
-      sources[src] = arr.reduce((a,b)=>a+(b.v||0),0);
+      const arr = bucket.sources[src].filter((p) => p.t >= cutoff);
+      if (honeySources[src]) {
+        honeySources[src] = arr.map((p) => ({ t: p.t, v: p.v }));
+        honeySourcesTotals[src] = arr.reduce((a, b) => a + (b.v || 0), 0);
+      }
     }
-    res.json({ honey, pollen, backpack, tokens, tokenCounts, buffs, honeySources: sources, honeySourcesTotals: sources, currentHoney: bucket.currentHoney || 0 });
+    res.json({
+      honey,
+      pollen,
+      backpack,
+      tokens,
+      tokenCounts,
+      buffs,
+      honeySources,
+      honeySourcesTotals,
+      currentHoney: bucket.currentHoney || 0
+    });
   };
 
   if (!USE_DB) return respondFromMemory();
