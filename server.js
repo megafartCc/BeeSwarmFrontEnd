@@ -1,7 +1,7 @@
 // Simple Railway-ready backend for Bee Swarm stats.
 // Endpoints:
-//   GET  /api/stats?period=24h            -> { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}] }
-//   POST /api/ingest (body: {honey, pollen, backpack, at?}) with x-api-key header
+//   GET  /api/stats?period=24h            -> { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], nectar: { Comforting: [{t,v}], ... } }
+//   POST /api/ingest (body: {honey, pollen, backpack, nectar, at?}) with x-api-key header
 //   Both endpoints require x-user-key to scope data per user.
 // Auth:
 //   Read (GET):   x-client-key must match CLIENT_KEY (if set) AND x-user-key present
@@ -23,12 +23,29 @@ app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
 // In-memory stores keyed by userKey:
-// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], currentHoney: 0 }
+// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], nectar: {Type:[{t,v}]}, currentHoney: 0 }
 // controlStates: { state, at }
 // controlCommands: [ {command, at} ]
 const samples = {};
 const controlStates = {};
 const controlCommands = {};
+const NECTAR_TYPES = ["Comforting", "Motivating", "Satisfying", "Refreshing", "Invigorating"];
+const BASE_METRICS = ["honey", "pollen", "backpack"];
+const nectarMetricForType = (type) => `nectar_${type.toLowerCase()}`;
+const NECTAR_METRICS = NECTAR_TYPES.map((type) => nectarMetricForType(type));
+const ALL_METRICS = [...BASE_METRICS, ...NECTAR_METRICS];
+const nectarTypeFromMetric = (metric) => {
+  if (!metric || !metric.startsWith("nectar_")) return null;
+  const slug = metric.slice("nectar_".length);
+  return NECTAR_TYPES.find((type) => type.toLowerCase() === slug) || null;
+};
+const createEmptyNectarBucket = () => {
+  const obj = {};
+  NECTAR_TYPES.forEach((type) => {
+    obj[type] = [];
+  });
+  return obj;
+};
 
 // MySQL config (set these env vars on Railway to enable DB mode)
 const MYSQL_HOST = process.env.MYSQL_HOST || process.env.MYSQLHOST;
@@ -63,7 +80,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS samples (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       user_key VARCHAR(128) NOT NULL,
-      metric ENUM('honey','pollen','backpack') NOT NULL,
+      metric ENUM(${ALL_METRICS.map((m) => `'${m}'`).join(",")}) NOT NULL,
       t INT NOT NULL,
       v DOUBLE NOT NULL,
       INDEX idx_user_time (user_key, t),
@@ -72,7 +89,7 @@ async function initDb() {
   `);
   // Ensure ENUM includes 'backpack' even if table already existed
   try {
-    await dbPool.query(`ALTER TABLE samples MODIFY COLUMN metric ENUM('honey','pollen','backpack') NOT NULL`);
+    await dbPool.query(`ALTER TABLE samples MODIFY COLUMN metric ENUM(${ALL_METRICS.map((m) => `'${m}'`).join(",")}) NOT NULL`);
   } catch (e) {
     // ignore; column may already be in desired shape
   }
@@ -128,8 +145,12 @@ function getBucket(userKey) {
       honey: [],
       pollen: [],
       backpack: [],
+      nectar: createEmptyNectarBucket(),
       currentHoney: 0
     };
+  }
+  if (!samples[userKey].nectar) {
+    samples[userKey].nectar = createEmptyNectarBucket();
   }
   return samples[userKey];
 }
@@ -149,11 +170,15 @@ app.get("/api/stats", requireReadKey, (req, res) => {
     const honey = bucket.honey.filter((p) => p.t >= cutoff);
     const pollen = bucket.pollen.filter((p) => p.t >= cutoff);
     const backpack = bucket.backpack.filter((p) => p.t >= cutoff);
+    const nectar = {};
+    NECTAR_TYPES.forEach((type) => {
+      nectar[type] = (bucket.nectar[type] || []).filter((p) => p.t >= cutoff);
+    });
     res.json({
       honey,
       pollen,
       backpack,
-      // tokens/buffs removed
+      nectar,
       currentHoney: bucket.currentHoney || 0
     });
   };
@@ -169,18 +194,24 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       const honey = [];
       const pollen = [];
       const backpack = [];
+      const nectar = {};
+      NECTAR_TYPES.forEach((type) => {
+        nectar[type] = [];
+      });
       for (const row of rows) {
         if (row.metric === "honey") honey.push({ t: row.t, v: row.v });
         else if (row.metric === "pollen") pollen.push({ t: row.t, v: row.v });
         else if (row.metric === "backpack") backpack.push({ t: row.t, v: row.v });
+        else {
+          const nectarType = nectarTypeFromMetric(row.metric);
+          if (nectarType) {
+            nectar[nectarType].push({ t: row.t, v: row.v });
+          }
+        }
       }
-      const tokens = [];
-      const buffs = {};
-      const tokenCounts = {};
-      const tokenCountsAll = {};
       const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
       const currentHoney = userRows && userRows[0] ? userRows[0].current_honey || 0 : 0;
-      res.json({ honey, pollen, backpack, currentHoney });
+      res.json({ honey, pollen, backpack, nectar, currentHoney });
     } catch (err) {
       console.error(err);
       respondFromMemory();
@@ -190,14 +221,19 @@ app.get("/api/stats", requireReadKey, (req, res) => {
 
 // POST ingest
 app.post("/api/ingest", requireWriteKey, (req, res) => {
-  const { honey, pollen, backpack, at, currentHoney } = req.body || {};
+  const { honey, pollen, backpack, nectar, at, currentHoney } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
+  const hasNectar =
+    nectar &&
+    typeof nectar === "object" &&
+    NECTAR_TYPES.some((type) => typeof nectar[type] === "number" && isFinite(nectar[type]));
 
   if (
     typeof honey !== "number" &&
     typeof pollen !== "number" &&
     typeof backpack !== "number" &&
-    typeof currentHoney !== "number"
+    typeof currentHoney !== "number" &&
+    !hasNectar
   ) {
     return res.status(400).json({ error: "no metrics provided" });
   }
@@ -216,10 +252,21 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     if (typeof currentHoney === "number") {
       bucket.currentHoney = currentHoney;
     }
+    if (hasNectar) {
+      NECTAR_TYPES.forEach((type) => {
+        const value = nectar[type];
+        if (typeof value === "number" && isFinite(value)) {
+          bucket.nectar[type].push({ t, v: value });
+        }
+      });
+    }
     const cutoff = nowSec() - 86400 * 30;
     bucket.honey = bucket.honey.filter((p) => p.t >= cutoff);
     bucket.pollen = bucket.pollen.filter((p) => p.t >= cutoff);
     bucket.backpack = bucket.backpack.filter((p) => p.t >= cutoff);
+    NECTAR_TYPES.forEach((type) => {
+      bucket.nectar[type] = bucket.nectar[type].filter((p) => p.t >= cutoff);
+    });
   };
 
   if (!USE_DB) {
@@ -239,6 +286,14 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
       }
       if (typeof backpack === "number" && isFinite(backpack)) {
         inserts.push(["backpack", t, backpack]);
+      }
+      if (hasNectar) {
+        NECTAR_TYPES.forEach((type) => {
+          const value = nectar[type];
+          if (typeof value === "number" && isFinite(value)) {
+            inserts.push([nectarMetricForType(type), t, value]);
+          }
+        });
       }
       if (inserts.length) {
         await dbPool.query(
