@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
 // In-memory stores keyed by userKey:
-// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], token: [], other: [] }, currentHoney: 0 }
+// samples: { honey: [{t,v}], pollen: [{t,v}], backpack: [{t,v}], tokens: [{t, token}], buffs: { [name]: [{t,v}] }, sources: { convert: [], gather: [], other: [] }, currentHoney: 0 }
 // controlStates: { state, at }
 // controlCommands: [ {command, at} ]
 const samples = {};
@@ -164,7 +164,6 @@ function getBucket(userKey) {
       sources: {
         convert: [],
         gather: [],
-        token: [],
         other: []
       },
       currentHoney: 0
@@ -194,14 +193,14 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       buffs[name] = bucket.buffs[name].filter((p) => p.t >= cutoff).slice(-200);
     }
     const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
-    const honeySources = { convert: [], gather: [], token: [], other: [] };
-    const honeySourcesTotals = { convert: 0, gather: 0, token: 0, other: 0 };
+    const honeySources = { convert: [], gather: [], other: [] };
+    const honeySourcesTotals = { convert: 0, gather: 0, other: 0 };
     for (const src in bucket.sources) {
+      const target = src === "token" ? "other" : (honeySources[src] ? src : "other");
       const arr = bucket.sources[src].filter((p) => p.t >= cutoff);
-      if (honeySources[src]) {
-        honeySources[src] = arr.map((p) => ({ t: p.t, v: p.v }));
-        honeySourcesTotals[src] = arr.reduce((a, b) => a + (b.v || 0), 0);
-      }
+      if (!Array.isArray(honeySources[target])) honeySources[target] = [];
+      honeySources[target].push(...arr.map((p) => ({ t: p.t, v: p.v })));
+      honeySourcesTotals[target] = (honeySourcesTotals[target] || 0) + arr.reduce((a, b) => a + (b.v || 0), 0);
     }
     res.json({
       honey,
@@ -251,12 +250,13 @@ app.get("/api/stats", requireReadKey, (req, res) => {
         buffs[row.name].push({ t: row.t, v: row.v });
       }
       const tokenCounts = tokens.reduce((acc, t) => { acc[t.token] = (acc[t.token] || 0) + 1; return acc; }, {});
-      const honeySources = { convert: [], gather: [], token: [], other: [] };
-      const honeySourcesTotals = { convert: 0, gather: 0, token: 0, other: 0 };
+      const honeySources = { convert: [], gather: [], other: [] };
+      const honeySourcesTotals = { convert: 0, gather: 0, other: 0 };
       for (const row of srcRows) {
-        if (honeySources[row.src]) {
-          honeySources[row.src].push({ t: row.t, v: row.v });
-          honeySourcesTotals[row.src] += row.v || 0;
+        const target = row.src === "token" ? "other" : row.src;
+        if (honeySources[target]) {
+          honeySources[target].push({ t: row.t, v: row.v });
+          honeySourcesTotals[target] += row.v || 0;
         }
       }
       const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
@@ -319,8 +319,9 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
       const srcs = ["convert","gather","token","other"];
       srcs.forEach(src => {
         if (typeof honeySources[src] === "number") {
-          bucket.sources[src].push({ t, v: honeySources[src] });
-          bucket.sources[src] = bucket.sources[src].slice(-400);
+          const target = src === "token" ? "other" : src;
+          bucket.sources[target].push({ t, v: honeySources[src] });
+          bucket.sources[target] = bucket.sources[target].slice(-400);
         }
       });
     }
@@ -387,7 +388,8 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
         ["convert","gather","token","other"].forEach(src => {
           const val = honeySources[src];
           if (typeof val === "number") {
-            srcRows.push([req.userKey, src, t, val]);
+            const target = src === "token" ? "other" : src;
+            srcRows.push([req.userKey, target, t, val]);
           }
         });
         if (srcRows.length) {
