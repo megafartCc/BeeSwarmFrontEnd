@@ -55,6 +55,7 @@ const MYSQL_USER = process.env.MYSQL_USER || process.env.MYSQLUSER;
 const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || process.env.MYSQLPASSWORD;
 const MYSQL_DATABASE = process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE;
 const USE_DB = !!(MYSQL_HOST && MYSQL_USER && MYSQL_PASSWORD && MYSQL_DATABASE);
+const CONFIG_TABLE = "configs";
 let dbPool = null;
 
 async function initDb() {
@@ -96,6 +97,14 @@ async function initDb() {
     // ignore; column may already be in desired shape
   }
   // tokens/buffs tables omitted (feature removed)
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
+      config_key VARCHAR(64) PRIMARY KEY,
+      user_key VARCHAR(128) NOT NULL,
+      payload JSON NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB;
+  `);
 }
 
 // Helpers
@@ -263,25 +272,64 @@ app.post("/api/configs", requireWriteKey, (req, res) => {
   if (typeof key !== "string" || !configKeyRegex.test(key)) {
     key = generateConfigKey();
   }
-  configs[key] = {
+  const entry = {
     config,
     owner: req.userKey,
     at: nowSec(),
   };
-  res.json({ ok: true, key });
+  configs[key] = entry;
+  if (!USE_DB) {
+    return res.json({ ok: true, key, mode: "memory" });
+  }
+  (async () => {
+    try {
+      await dbPool.query(
+        `REPLACE INTO ${CONFIG_TABLE} (config_key, user_key, payload, created_at) VALUES (?, ?, ?, FROM_UNIXTIME(?))`,
+        [key, req.userKey, JSON.stringify(config), entry.at]
+      );
+      res.json({ ok: true, key, mode: "mysql" });
+    } catch (e) {
+      console.error("Failed to write config to DB:", e);
+      res.json({ ok: true, key, mode: "memory-fallback" });
+    }
+  })();
 });
 
 app.get("/api/configs/:key", requireConfigReadKey, (req, res) => {
   const key = req.params.key;
   const entry = key && configs[key];
-  if (!entry) {
-    return res.status(404).json({ error: "not found" });
+  const respond = (record) => {
+    if (!record) {
+      return res.status(404).json({ error: "not found" });
+    }
+    res.json({
+      config: record.config,
+      owner: record.owner || null,
+      at: record.at || nowSec(),
+    });
+  };
+  if (!USE_DB) {
+    return respond(entry);
   }
-  res.json({
-    config: entry.config,
-    owner: entry.owner || null,
-    at: entry.at || nowSec(),
-  });
+  (async () => {
+    try {
+      const [rows] = await dbPool.query(
+        `SELECT config_key, user_key, payload, UNIX_TIMESTAMP(created_at) AS at FROM ${CONFIG_TABLE} WHERE config_key = ? LIMIT 1`,
+        [key]
+      );
+      if (rows && rows[0]) {
+        const row = rows[0];
+        let parsed = {};
+        try { parsed = JSON.parse(row.payload); } catch (e) { parsed = {}; }
+        respond({ config: parsed, owner: row.user_key, at: row.at || nowSec() });
+      } else {
+        respond(entry);
+      }
+    } catch (e) {
+      console.error("Failed to fetch config from DB:", e);
+      respond(entry);
+    }
+  })();
 });
 
 // POST ingest
