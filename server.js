@@ -13,6 +13,7 @@
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "replace-this-api-key";          // used by your script to push samples
@@ -29,6 +30,7 @@ app.use(express.json({ limit: "256kb" }));
 const samples = {};
 const controlStates = {};
 const controlCommands = {};
+const configs = {};
 const NECTAR_TYPES = ["Comforting", "Motivating", "Satisfying", "Refreshing", "Invigorating"];
 const BASE_METRICS = ["honey", "pollen", "backpack"];
 const nectarMetricForType = (type) => `nectar_${type.toLowerCase()}`;
@@ -139,6 +141,22 @@ const requireWriteKey = (req, res, next) => {
   next();
 };
 
+const requireConfigReadKey = (req, res, next) => {
+  if (!CLIENT_KEY || CLIENT_KEY === "replace-this-client-key") {
+    return next();
+  }
+  const key = req.header("x-client-key") || req.header("x-api-key");
+  if (key !== CLIENT_KEY && key !== API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+};
+
+const CONFIG_JSON_LIMIT = 256 * 1024; // bytes
+const configKeyRegex = /^[A-Za-z0-9_-]{6,64}$/;
+const generateConfigKey = () =>
+  crypto.randomBytes(12).toString("base64url").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 18);
+
 function getBucket(userKey) {
   if (!samples[userKey]) {
     samples[userKey] = {
@@ -217,6 +235,46 @@ app.get("/api/stats", requireReadKey, (req, res) => {
       respondFromMemory();
     }
   })();
+});
+
+// Config sharing (in-memory)
+app.post("/api/configs", requireWriteKey, (req, res) => {
+  const config = req.body && req.body.config;
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return res.status(400).json({ error: "config object required" });
+  }
+  let json;
+  try {
+    json = JSON.stringify(config);
+  } catch (e) {
+    return res.status(400).json({ error: "config not serializable" });
+  }
+  if (!json || json.length > CONFIG_JSON_LIMIT) {
+    return res.status(413).json({ error: "config too large" });
+  }
+  let key = req.body && req.body.key;
+  if (typeof key !== "string" || !configKeyRegex.test(key)) {
+    key = generateConfigKey();
+  }
+  configs[key] = {
+    config,
+    owner: req.userKey,
+    at: nowSec(),
+  };
+  res.json({ ok: true, key });
+});
+
+app.get("/api/configs/:key", requireConfigReadKey, (req, res) => {
+  const key = req.params.key;
+  const entry = key && configs[key];
+  if (!entry) {
+    return res.status(404).json({ error: "not found" });
+  }
+  res.json({
+    config: entry.config,
+    owner: entry.owner || null,
+    at: entry.at || nowSec(),
+  });
 });
 
 // POST ingest
