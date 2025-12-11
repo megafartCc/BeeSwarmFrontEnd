@@ -153,9 +153,16 @@ const requireConfigReadKey = (req, res, next) => {
 };
 
 const CONFIG_JSON_LIMIT = 256 * 1024; // bytes
-const configKeyRegex = /^[A-Za-z0-9_-]{6,64}$/;
-const generateConfigKey = () =>
-  crypto.randomBytes(12).toString("base64url").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 18);
+const configKeyRegex = /^[A-Z0-9\[\]-]{10,32}$/;
+const KEY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]";
+function generateConfigKey(len = 20) {
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    const idx = crypto.randomInt(0, KEY_ALPHABET.length);
+    out += KEY_ALPHABET[idx];
+  }
+  return out;
+}
 
 function getBucket(userKey) {
   if (!samples[userKey]) {
