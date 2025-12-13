@@ -88,6 +88,15 @@ const recordMemorySession = (userKey, playerId, username, lastSeen, currentHoney
   cachePublicMapping(publicId, userKey, username);
 };
 
+const deriveSessionPlayerId = (userKey, rawPlayerId, username) => {
+  const normalized = normalizePlayerId(rawPlayerId);
+  if (normalized) return normalized;
+  const basis = sanitizeUsername(username) || String(userKey || "");
+  if (!basis) return null;
+  const hash = crypto.createHash("sha1").update(`${userKey || ""}:${basis}`).digest();
+  return hash.readUInt32BE(0);
+};
+
 async function recordDbSession(userKey, playerId, username, lastSeen, currentHoney) {
   if (!USE_DB || !dbPool || !userKey || !playerId) return;
   const publicId = getSessionPublicId(userKey, playerId);
@@ -672,7 +681,7 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
   } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
   const cleanedName = sanitizeUsername(username);
-  const numericPlayerId = normalizePlayerId(playerId);
+  const sessionPlayerId = deriveSessionPlayerId(req.userKey, playerId, cleanedName);
   const hasNectar =
     nectar &&
     typeof nectar === "object" &&
@@ -739,10 +748,10 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     NECTAR_TYPES.forEach((type) => {
       bucket.nectar[type] = bucket.nectar[type].filter((p) => p.t >= cutoff);
     });
-    if (numericPlayerId) {
+    if (sessionPlayerId) {
       recordMemorySession(
         req.userKey,
-        numericPlayerId,
+        sessionPlayerId,
         bucket.username || cleanedName || "Player",
         t,
         sessionHoney
@@ -796,10 +805,10 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
           req.userKey
         ]
       );
-      if (numericPlayerId) {
+      if (sessionPlayerId) {
         await recordDbSession(
           req.userKey,
-          numericPlayerId,
+          sessionPlayerId,
           cleanedName || null,
           t,
           typeof currentHoney === "number" ? currentHoney : null
