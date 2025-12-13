@@ -37,6 +37,7 @@ const BASE_METRICS = ["honey", "pollen", "backpack", "backpack_capacity"];
 const nectarMetricForType = (type) => `nectar_${type.toLowerCase()}`;
 const NECTAR_METRICS = NECTAR_TYPES.map((type) => nectarMetricForType(type));
 const ALL_METRICS = [...BASE_METRICS, ...NECTAR_METRICS];
+const memorySessions = {};
 const nectarTypeFromMetric = (metric) => {
   if (!metric || !metric.startsWith("nectar_")) return null;
   const slug = metric.slice("nectar_".length);
@@ -50,6 +51,64 @@ const createEmptyNectarBucket = () => {
   return obj;
 };
 
+const cachePublicMapping = (publicId, userKey, username) => {
+  if (!publicId || !userKey) return;
+  publicIdToUserKey[publicId] = { userKey, username: username || null };
+};
+
+const normalizePlayerId = (value) => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) {
+      return Math.max(0, Math.floor(parsed));
+    }
+  }
+  return null;
+};
+
+const getSessionPublicId = (userKey, playerId) => {
+  if (!userKey || !playerId) return null;
+  return crypto.createHash("sha1").update(`${userKey}:${playerId}`).digest("hex").slice(0, 16);
+};
+
+const recordMemorySession = (userKey, playerId, username, lastSeen, currentHoney) => {
+  if (!userKey || !playerId) return;
+  if (!memorySessions[userKey]) memorySessions[userKey] = {};
+  const publicId = getSessionPublicId(userKey, playerId);
+  memorySessions[userKey][playerId] = {
+    playerId,
+    username: username || "Player",
+    lastSeen,
+    currentHoney: currentHoney || 0,
+    publicId
+  };
+  cachePublicMapping(publicId, userKey, username);
+};
+
+async function recordDbSession(userKey, playerId, username, lastSeen, currentHoney) {
+  if (!USE_DB || !dbPool || !userKey || !playerId) return;
+  const publicId = getSessionPublicId(userKey, playerId);
+  try {
+    await dbPool.query(
+      `
+        INSERT INTO ${PLAYER_SESSIONS_TABLE} (session_public_id, user_key, player_id, username, last_seen, current_honey)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          username = COALESCE(VALUES(username), username),
+          last_seen = VALUES(last_seen),
+          current_honey = COALESCE(VALUES(current_honey), current_honey)
+      `,
+      [publicId, userKey, playerId, username || null, lastSeen, typeof currentHoney === "number" ? currentHoney : null]
+    );
+    cachePublicMapping(publicId, userKey, username);
+  } catch (err) {
+    console.error("Failed to upsert player session:", err);
+  }
+}
+
 // MySQL config (set these env vars on Railway to enable DB mode)
 const MYSQL_HOST = process.env.MYSQL_HOST || process.env.MYSQLHOST;
 const MYSQL_USER = process.env.MYSQL_USER || process.env.MYSQLUSER;
@@ -58,6 +117,7 @@ const MYSQL_DATABASE = process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE;
 const USE_DB = !!(MYSQL_HOST && MYSQL_USER && MYSQL_PASSWORD && MYSQL_DATABASE);
 const CONFIG_TABLE = "configs";
 const ONLINE_TIMEOUT = 120; // seconds to consider player online
+const PLAYER_SESSIONS_TABLE = "player_sessions";
 let dbPool = null;
 
 async function initDb() {
@@ -107,6 +167,19 @@ async function initDb() {
       user_key VARCHAR(128) NOT NULL,
       payload JSON NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB;
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ${PLAYER_SESSIONS_TABLE} (
+      session_public_id VARCHAR(32) PRIMARY KEY,
+      user_key VARCHAR(128) NOT NULL,
+      player_id BIGINT NOT NULL,
+      username VARCHAR(64),
+      last_seen INT DEFAULT 0,
+      current_honey BIGINT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_user_player (user_key, player_id),
+      FOREIGN KEY (user_key) REFERENCES users(user_key) ON DELETE CASCADE
     ) ENGINE=InnoDB;
   `);
 }
@@ -222,7 +295,7 @@ function getBucket(userKey) {
   if (!samples[userKey].publicId) {
     samples[userKey].publicId = getPublicId(userKey);
   }
-  publicIdToUserKey[samples[userKey].publicId] = userKey;
+  cachePublicMapping(samples[userKey].publicId, userKey, samples[userKey].username);
   return samples[userKey];
 }
 
@@ -256,6 +329,7 @@ const mergeBackpackSeries = (backpackEntries, capacityEntries) => {
 
 function collectMemoryStats(userKey, cutoff) {
   const bucket = getBucket(userKey);
+  cachePublicMapping(bucket.publicId, userKey, bucket.username);
   const honey = bucket.honey.filter((p) => p.t >= cutoff);
   const pollen = bucket.pollen.filter((p) => p.t >= cutoff);
   const backpack = shapeBackpackEntries(bucket.backpack.filter((p) => p.t >= cutoff));
@@ -307,6 +381,8 @@ async function collectDbStats(userKey, cutoff) {
     [userKey]
   );
   const info = userRows && userRows[0] ? userRows[0] : {};
+  const resolvedPublicId = info.public_id || getPublicId(userKey);
+  cachePublicMapping(resolvedPublicId, userKey, info.username);
   return {
     honey,
     pollen,
@@ -315,40 +391,77 @@ async function collectDbStats(userKey, cutoff) {
     currentHoney: info.current_honey || 0,
     player: {
       username: info.username || "Player",
-      id: info.public_id || getPublicId(userKey)
+      id: resolvedPublicId
     }
   };
 }
 
-async function sendStatsResponse(userKey, periodSec, res) {
+async function sendStatsResponse(userKey, periodSec, res, overrides) {
   const cutoff = nowSec() - periodSec;
   if (!USE_DB) {
     const data = collectMemoryStats(userKey, cutoff);
+    if (overrides) {
+      if (overrides.username) data.player.username = overrides.username;
+      if (overrides.publicId) data.player.id = overrides.publicId;
+    }
     return res.json(data);
   }
   try {
     const data = await collectDbStats(userKey, cutoff);
+    if (overrides) {
+      if (overrides.username) data.player.username = overrides.username;
+      if (overrides.publicId) data.player.id = overrides.publicId;
+    }
     res.json(data);
   } catch (err) {
     console.error(err);
     const fallback = collectMemoryStats(userKey, cutoff);
+    if (overrides) {
+      if (overrides.username) fallback.player.username = overrides.username;
+      if (overrides.publicId) fallback.player.id = overrides.publicId;
+    }
     res.json(fallback);
   }
 }
 
 async function resolveUserKeyFromPublicId(publicId) {
   if (!publicId) return null;
-  if (publicIdToUserKey[publicId]) {
-    return publicIdToUserKey[publicId];
+  const cached = publicIdToUserKey[publicId];
+  if (cached) {
+    return { userKey: cached.userKey, username: cached.username || null, publicId };
   }
-  if (!USE_DB) return null;
+  if (!USE_DB) {
+    for (const [userKey, bucket] of Object.entries(samples)) {
+      if (bucket && bucket.publicId === publicId) {
+        cachePublicMapping(publicId, userKey, bucket.username);
+        return { userKey, username: bucket.username || null, publicId };
+      }
+    }
+    for (const [userKey, sessions] of Object.entries(memorySessions)) {
+      for (const session of Object.values(sessions)) {
+        if (session && session.publicId === publicId) {
+          cachePublicMapping(publicId, userKey, session.username);
+          return { userKey, username: session.username || null, publicId };
+        }
+      }
+    }
+    return null;
+  }
   const [rows] = await dbPool.query(
-    "SELECT user_key FROM users WHERE public_id = ? LIMIT 1",
+    "SELECT user_key, username FROM users WHERE public_id = ? LIMIT 1",
     [publicId]
   );
   if (rows && rows[0]) {
-    publicIdToUserKey[publicId] = rows[0].user_key;
-    return rows[0].user_key;
+    cachePublicMapping(publicId, rows[0].user_key, rows[0].username);
+    return { userKey: rows[0].user_key, username: rows[0].username || null, publicId };
+  }
+  const [sessionRows] = await dbPool.query(
+    `SELECT user_key, username FROM ${PLAYER_SESSIONS_TABLE} WHERE session_public_id = ? LIMIT 1`,
+    [publicId]
+  );
+  if (sessionRows && sessionRows[0]) {
+    cachePublicMapping(publicId, sessionRows[0].user_key, sessionRows[0].username);
+    return { userKey: sessionRows[0].user_key, username: sessionRows[0].username || null, publicId };
   }
   return null;
 }
@@ -372,7 +485,22 @@ app.get("/api/players", requireViewerKey, async (_req, res) => {
   const now = nowSec();
   const list = [];
   if (!USE_DB) {
+    const seenKeys = new Set();
+    Object.entries(memorySessions).forEach(([userKey, sessions]) => {
+      Object.values(sessions).forEach((session) => {
+        if (!session || !session.lastSeen) return;
+        if (now - session.lastSeen > ONLINE_TIMEOUT) return;
+        list.push({
+          id: session.publicId,
+          username: session.username || "Player",
+          lastSeen: session.lastSeen,
+          currentHoney: session.currentHoney || 0
+        });
+        seenKeys.add(userKey);
+      });
+    });
     Object.entries(samples).forEach(([userKey, bucket]) => {
+      if (seenKeys.has(userKey)) return;
       if (!bucket || !bucket.lastSeen) return;
       if (now - bucket.lastSeen > ONLINE_TIMEOUT) return;
       list.push({
@@ -391,13 +519,34 @@ app.get("/api/players", requireViewerKey, async (_req, res) => {
   }
   try {
     const cutoff = now - ONLINE_TIMEOUT;
+    const seenKeys = new Set();
+    const [sessionRows] = await dbPool.query(
+      `
+        SELECT session_public_id, user_key, username, current_honey, last_seen
+        FROM ${PLAYER_SESSIONS_TABLE}
+        WHERE last_seen >= ?
+      `,
+      [cutoff]
+    );
+    sessionRows.forEach((row) => {
+      if (!row) return;
+      cachePublicMapping(row.session_public_id, row.user_key, row.username);
+      seenKeys.add(row.user_key);
+      list.push({
+        id: row.session_public_id,
+        username: row.username || "Player",
+        lastSeen: row.last_seen || now,
+        currentHoney: row.current_honey || 0
+      });
+    });
     const [rows] = await dbPool.query(
       "SELECT user_key, username, current_honey, public_id, last_activity FROM users WHERE last_activity >= ? ORDER BY username ASC",
       [cutoff]
     );
     rows.forEach((row) => {
       if (!row.public_id) return;
-      publicIdToUserKey[row.public_id] = row.user_key;
+      if (seenKeys.has(row.user_key)) return;
+      cachePublicMapping(row.public_id, row.user_key, row.username);
       list.push({
         id: row.public_id,
         username: row.username || "Player",
@@ -418,12 +567,15 @@ app.get("/api/players", requireViewerKey, async (_req, res) => {
 });
 
 app.get("/api/player/:publicId/stats", requireViewerKey, async (req, res) => {
-  const userKey = await resolveUserKeyFromPublicId(req.params.publicId);
-  if (!userKey) {
+  const resolved = await resolveUserKeyFromPublicId(req.params.publicId);
+  if (!resolved) {
     return res.status(404).json({ error: "not found" });
   }
   const periodSec = toSeconds(req.query.period || "24h");
-  sendStatsResponse(userKey, periodSec, res);
+  sendStatsResponse(resolved.userKey, periodSec, res, {
+    username: resolved.username || null,
+    publicId: resolved.publicId || req.params.publicId
+  });
 });
 
 // Config sharing (in-memory)
@@ -515,9 +667,12 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     nectar,
     at,
     currentHoney,
-    username
+    username,
+    playerId
   } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
+  const cleanedName = sanitizeUsername(username);
+  const numericPlayerId = normalizePlayerId(playerId);
   const hasNectar =
     nectar &&
     typeof nectar === "object" &&
@@ -536,10 +691,10 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
   const writeMemory = () => {
     const bucket = getBucket(req.userKey);
     bucket.lastSeen = t;
-    const cleanedName = sanitizeUsername(username);
     if (cleanedName) {
       bucket.username = cleanedName;
     }
+    cachePublicMapping(bucket.publicId, req.userKey, bucket.username);
     if (typeof honey === "number" && isFinite(honey)) {
       bucket.honey.push({ t, v: honey });
     }
@@ -568,6 +723,7 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     if (typeof currentHoney === "number") {
       bucket.currentHoney = currentHoney;
     }
+    const sessionHoney = typeof currentHoney === "number" ? currentHoney : bucket.currentHoney || 0;
     if (hasNectar) {
       NECTAR_TYPES.forEach((type) => {
         const value = nectar[type];
@@ -583,6 +739,15 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
     NECTAR_TYPES.forEach((type) => {
       bucket.nectar[type] = bucket.nectar[type].filter((p) => p.t >= cutoff);
     });
+    if (numericPlayerId) {
+      recordMemorySession(
+        req.userKey,
+        numericPlayerId,
+        bucket.username || cleanedName || "Player",
+        t,
+        sessionHoney
+      );
+    }
   };
 
   if (!USE_DB) {
@@ -593,6 +758,7 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
   (async () => {
     try {
       await ensureUser(req.userKey);
+      cachePublicMapping(getPublicId(req.userKey), req.userKey, cleanedName);
       const inserts = [];
       if (typeof honey === "number" && isFinite(honey)) {
         inserts.push(["honey", t, honey]);
@@ -621,7 +787,6 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
         );
       }
 
-      const cleanedName = sanitizeUsername(username);
       await dbPool.query(
         "UPDATE users SET current_honey = COALESCE(?, current_honey), last_activity = ?, username = COALESCE(?, username) WHERE user_key = ?",
         [
@@ -631,6 +796,15 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
           req.userKey
         ]
       );
+      if (numericPlayerId) {
+        await recordDbSession(
+          req.userKey,
+          numericPlayerId,
+          cleanedName || null,
+          t,
+          typeof currentHoney === "number" ? currentHoney : null
+        );
+      }
 
       res.json({ ok: true, mode: "mysql" });
     } catch (err) {
