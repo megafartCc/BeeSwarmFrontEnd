@@ -31,8 +31,9 @@ const samples = {};
 const controlStates = {};
 const controlCommands = {};
 const configs = {};
+const publicIdToUserKey = {};
 const NECTAR_TYPES = ["Comforting", "Motivating", "Satisfying", "Refreshing", "Invigorating"];
-const BASE_METRICS = ["honey", "pollen", "backpack"];
+const BASE_METRICS = ["honey", "pollen", "backpack", "backpack_capacity"];
 const nectarMetricForType = (type) => `nectar_${type.toLowerCase()}`;
 const NECTAR_METRICS = NECTAR_TYPES.map((type) => nectarMetricForType(type));
 const ALL_METRICS = [...BASE_METRICS, ...NECTAR_METRICS];
@@ -56,6 +57,7 @@ const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || process.env.MYSQLPASSWORD;
 const MYSQL_DATABASE = process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE;
 const USE_DB = !!(MYSQL_HOST && MYSQL_USER && MYSQL_PASSWORD && MYSQL_DATABASE);
 const CONFIG_TABLE = "configs";
+const ONLINE_TIMEOUT = 120; // seconds to consider player online
 let dbPool = null;
 
 async function initDb() {
@@ -79,6 +81,8 @@ async function initDb() {
   await addColumn(`ALTER TABLE users ADD COLUMN total_honey BIGINT DEFAULT 0`);
   await addColumn(`ALTER TABLE users ADD COLUMN last_activity INT DEFAULT 0`);
   await addColumn(`ALTER TABLE users ADD COLUMN current_honey BIGINT DEFAULT 0`);
+  await addColumn(`ALTER TABLE users ADD COLUMN username VARCHAR(64) DEFAULT NULL`);
+  await addColumn(`ALTER TABLE users ADD COLUMN public_id VARCHAR(32) UNIQUE`);
   await dbPool.query(`
     CREATE TABLE IF NOT EXISTS samples (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -161,6 +165,17 @@ const requireConfigReadKey = (req, res, next) => {
   next();
 };
 
+const requireViewerKey = (req, res, next) => {
+  if (!CLIENT_KEY || CLIENT_KEY === "replace-this-client-key") {
+    return res.status(400).json({ error: "viewer disabled" });
+  }
+  const key = req.header("x-client-key");
+  if (key !== CLIENT_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+};
+
 const CONFIG_JSON_LIMIT = 256 * 1024; // bytes
 const configKeyRegex = /^[A-Z0-9\[\]-]{10,32}$/;
 const KEY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]";
@@ -173,6 +188,20 @@ function generateConfigKey(len = 20) {
   return out;
 }
 
+const sanitizeUsername = (name) => {
+  if (typeof name !== "string") return null;
+  return name.trim().slice(0, 32) || null;
+};
+
+const clampPercent = (value) => {
+  if (!isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+};
+
+const getPublicId = (userKey) => {
+  return crypto.createHash("sha1").update(String(userKey)).digest("hex").slice(0, 12);
+};
+
 function getBucket(userKey) {
   if (!samples[userKey]) {
     samples[userKey] = {
@@ -180,77 +209,221 @@ function getBucket(userKey) {
       pollen: [],
       backpack: [],
       nectar: createEmptyNectarBucket(),
-      currentHoney: 0
+      currentHoney: 0,
+      lastCapacity: 0,
+      username: null,
+      publicId: getPublicId(userKey),
+      lastSeen: 0
     };
   }
   if (!samples[userKey].nectar) {
     samples[userKey].nectar = createEmptyNectarBucket();
   }
+  if (!samples[userKey].publicId) {
+    samples[userKey].publicId = getPublicId(userKey);
+  }
+  publicIdToUserKey[samples[userKey].publicId] = userKey;
   return samples[userKey];
+}
+
+const shapeBackpackEntries = (entries) => {
+  return entries.map((entry) => {
+    const pct =
+      typeof entry.pct === "number"
+        ? clampPercent(entry.pct)
+        : entry.cap && entry.cap > 0
+          ? clampPercent((entry.v / entry.cap) * 100)
+          : 0;
+    return { t: entry.t, v: entry.v, pct };
+  });
+};
+
+const mergeBackpackSeries = (backpackEntries, capacityEntries) => {
+  const capacityByTime = new Map();
+  let lastCap = 0;
+  capacityEntries.forEach((entry) => {
+    capacityByTime.set(entry.t, entry.v);
+  });
+  return backpackEntries.map((entry) => {
+    const cap = capacityByTime.get(entry.t) ?? lastCap;
+    if (cap && cap > 0) {
+      lastCap = cap;
+    }
+    const pct = cap && cap > 0 ? clampPercent((entry.v / cap) * 100) : 0;
+    return { t: entry.t, v: entry.v, pct };
+  });
+};
+
+function collectMemoryStats(userKey, cutoff) {
+  const bucket = getBucket(userKey);
+  const honey = bucket.honey.filter((p) => p.t >= cutoff);
+  const pollen = bucket.pollen.filter((p) => p.t >= cutoff);
+  const backpack = shapeBackpackEntries(bucket.backpack.filter((p) => p.t >= cutoff));
+  const nectar = {};
+  NECTAR_TYPES.forEach((type) => {
+    nectar[type] = (bucket.nectar[type] || []).filter((p) => p.t >= cutoff);
+  });
+  return {
+    honey,
+    pollen,
+    backpack,
+    nectar,
+    currentHoney: bucket.currentHoney || 0,
+    player: {
+      username: bucket.username || "Player",
+      id: bucket.publicId
+    }
+  };
+}
+
+async function collectDbStats(userKey, cutoff) {
+  const [rows] = await dbPool.query(
+    "SELECT metric, t, v FROM samples WHERE user_key = ? AND t >= ? ORDER BY t ASC",
+    [userKey, cutoff]
+  );
+  const honey = [];
+  const pollen = [];
+  const backpackRaw = [];
+  const capacityEntries = [];
+  const nectar = {};
+  NECTAR_TYPES.forEach((type) => {
+    nectar[type] = [];
+  });
+  for (const row of rows) {
+    if (row.metric === "honey") honey.push({ t: row.t, v: row.v });
+    else if (row.metric === "pollen") pollen.push({ t: row.t, v: row.v });
+    else if (row.metric === "backpack") backpackRaw.push({ t: row.t, v: row.v });
+    else if (row.metric === "backpack_capacity") capacityEntries.push({ t: row.t, v: row.v });
+    else {
+      const nectarType = nectarTypeFromMetric(row.metric);
+      if (nectarType) {
+        nectar[nectarType].push({ t: row.t, v: row.v });
+      }
+    }
+  }
+  const backpack = mergeBackpackSeries(backpackRaw, capacityEntries);
+  const [userRows] = await dbPool.query(
+    "SELECT current_honey, username, public_id FROM users WHERE user_key = ? LIMIT 1",
+    [userKey]
+  );
+  const info = userRows && userRows[0] ? userRows[0] : {};
+  return {
+    honey,
+    pollen,
+    backpack,
+    nectar,
+    currentHoney: info.current_honey || 0,
+    player: {
+      username: info.username || "Player",
+      id: info.public_id || getPublicId(userKey)
+    }
+  };
+}
+
+async function sendStatsResponse(userKey, periodSec, res) {
+  const cutoff = nowSec() - periodSec;
+  if (!USE_DB) {
+    const data = collectMemoryStats(userKey, cutoff);
+    return res.json(data);
+  }
+  try {
+    const data = await collectDbStats(userKey, cutoff);
+    res.json(data);
+  } catch (err) {
+    console.error(err);
+    const fallback = collectMemoryStats(userKey, cutoff);
+    res.json(fallback);
+  }
+}
+
+async function resolveUserKeyFromPublicId(publicId) {
+  if (!publicId) return null;
+  if (publicIdToUserKey[publicId]) {
+    return publicIdToUserKey[publicId];
+  }
+  if (!USE_DB) return null;
+  const [rows] = await dbPool.query(
+    "SELECT user_key FROM users WHERE public_id = ? LIMIT 1",
+    [publicId]
+  );
+  if (rows && rows[0]) {
+    publicIdToUserKey[publicId] = rows[0].user_key;
+    return rows[0].user_key;
+  }
+  return null;
 }
 
 async function ensureUser(userKey) {
   if (!USE_DB) return;
-  await dbPool.query("INSERT IGNORE INTO users (user_key) VALUES (?)", [userKey]);
+  const publicId = getPublicId(userKey);
+  await dbPool.query(
+    "INSERT INTO users (user_key, public_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE public_id = COALESCE(public_id, VALUES(public_id))",
+    [userKey, publicId]
+  );
 }
 
 // GET stats
 app.get("/api/stats", requireReadKey, (req, res) => {
   const periodSec = toSeconds(req.query.period || "24h");
-  const cutoff = nowSec() - periodSec;
+  sendStatsResponse(req.userKey, periodSec, res);
+});
 
-  const respondFromMemory = () => {
-    const bucket = getBucket(req.userKey);
-    const honey = bucket.honey.filter((p) => p.t >= cutoff);
-    const pollen = bucket.pollen.filter((p) => p.t >= cutoff);
-    const backpack = bucket.backpack.filter((p) => p.t >= cutoff);
-    const nectar = {};
-    NECTAR_TYPES.forEach((type) => {
-      nectar[type] = (bucket.nectar[type] || []).filter((p) => p.t >= cutoff);
-    });
-    res.json({
-      honey,
-      pollen,
-      backpack,
-      nectar,
-      currentHoney: bucket.currentHoney || 0
-    });
-  };
-
-  if (!USE_DB) return respondFromMemory();
-
-  (async () => {
-    try {
-      const [rows] = await dbPool.query(
-        "SELECT metric, t, v FROM samples WHERE user_key = ? AND t >= ? ORDER BY t ASC",
-        [req.userKey, cutoff]
-      );
-      const honey = [];
-      const pollen = [];
-      const backpack = [];
-      const nectar = {};
-      NECTAR_TYPES.forEach((type) => {
-        nectar[type] = [];
+app.get("/api/players", requireViewerKey, async (_req, res) => {
+  const now = nowSec();
+  const list = [];
+  if (!USE_DB) {
+    Object.entries(samples).forEach(([userKey, bucket]) => {
+      if (!bucket || !bucket.lastSeen) return;
+      if (now - bucket.lastSeen > ONLINE_TIMEOUT) return;
+      list.push({
+        id: bucket.publicId,
+        username: bucket.username || "Player",
+        lastSeen: bucket.lastSeen,
+        currentHoney: bucket.currentHoney || 0
       });
-      for (const row of rows) {
-        if (row.metric === "honey") honey.push({ t: row.t, v: row.v });
-        else if (row.metric === "pollen") pollen.push({ t: row.t, v: row.v });
-        else if (row.metric === "backpack") backpack.push({ t: row.t, v: row.v });
-        else {
-          const nectarType = nectarTypeFromMetric(row.metric);
-          if (nectarType) {
-            nectar[nectarType].push({ t: row.t, v: row.v });
-          }
-        }
-      }
-      const [userRows] = await dbPool.query("SELECT current_honey FROM users WHERE user_key = ? LIMIT 1", [req.userKey]);
-      const currentHoney = userRows && userRows[0] ? userRows[0].current_honey || 0 : 0;
-      res.json({ honey, pollen, backpack, nectar, currentHoney });
-    } catch (err) {
-      console.error(err);
-      respondFromMemory();
-    }
-  })();
+    });
+    list.sort((a, b) => {
+      const nameA = (a.username || "").toLowerCase();
+      const nameB = (b.username || "").toLowerCase();
+      return nameA.localeCompare(nameB);
+    });
+    return res.json({ players: list });
+  }
+  try {
+    const cutoff = now - ONLINE_TIMEOUT;
+    const [rows] = await dbPool.query(
+      "SELECT user_key, username, current_honey, public_id, last_activity FROM users WHERE last_activity >= ? ORDER BY username ASC",
+      [cutoff]
+    );
+    rows.forEach((row) => {
+      if (!row.public_id) return;
+      publicIdToUserKey[row.public_id] = row.user_key;
+      list.push({
+        id: row.public_id,
+        username: row.username || "Player",
+        lastSeen: row.last_activity || now,
+        currentHoney: row.current_honey || 0
+      });
+    });
+    list.sort((a, b) => {
+      const nameA = (a.username || "").toLowerCase();
+      const nameB = (b.username || "").toLowerCase();
+      return nameA.localeCompare(nameB);
+    });
+    res.json({ players: list });
+  } catch (err) {
+    console.error(err);
+    res.json({ players: [] });
+  }
+});
+
+app.get("/api/player/:publicId/stats", requireViewerKey, async (req, res) => {
+  const userKey = await resolveUserKeyFromPublicId(req.params.publicId);
+  if (!userKey) {
+    return res.status(404).json({ error: "not found" });
+  }
+  const periodSec = toSeconds(req.query.period || "24h");
+  sendStatsResponse(userKey, periodSec, res);
 });
 
 // Config sharing (in-memory)
@@ -334,7 +507,16 @@ app.get("/api/configs/:key", requireConfigReadKey, (req, res) => {
 
 // POST ingest
 app.post("/api/ingest", requireWriteKey, (req, res) => {
-  const { honey, pollen, backpack, nectar, at, currentHoney } = req.body || {};
+  const {
+    honey,
+    pollen,
+    backpack,
+    backpackCapacity,
+    nectar,
+    at,
+    currentHoney,
+    username
+  } = req.body || {};
   const t = typeof at === "number" ? Math.floor(at) : nowSec();
   const hasNectar =
     nectar &&
@@ -353,6 +535,11 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
 
   const writeMemory = () => {
     const bucket = getBucket(req.userKey);
+    bucket.lastSeen = t;
+    const cleanedName = sanitizeUsername(username);
+    if (cleanedName) {
+      bucket.username = cleanedName;
+    }
     if (typeof honey === "number" && isFinite(honey)) {
       bucket.honey.push({ t, v: honey });
     }
@@ -360,7 +547,23 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
       bucket.pollen.push({ t, v: pollen });
     }
     if (typeof backpack === "number" && isFinite(backpack)) {
-      bucket.backpack.push({ t, v: backpack });
+      const entry = { t, v: backpack };
+      let capValue = bucket.lastCapacity || 0;
+      if (typeof backpackCapacity === "number" && isFinite(backpackCapacity)) {
+        capValue = backpackCapacity;
+        bucket.lastCapacity = backpackCapacity;
+      }
+      if (capValue > 0) {
+        entry.cap = capValue;
+        entry.pct = clampPercent((backpack / capValue) * 100);
+      } else {
+        entry.cap = null;
+        entry.pct = 0;
+      }
+      bucket.backpack.push(entry);
+    }
+    if (typeof backpackCapacity === "number" && isFinite(backpackCapacity)) {
+      bucket.lastCapacity = backpackCapacity;
     }
     if (typeof currentHoney === "number") {
       bucket.currentHoney = currentHoney;
@@ -400,6 +603,9 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
       if (typeof backpack === "number" && isFinite(backpack)) {
         inserts.push(["backpack", t, backpack]);
       }
+      if (typeof backpackCapacity === "number" && isFinite(backpackCapacity)) {
+        inserts.push(["backpack_capacity", t, backpackCapacity]);
+      }
       if (hasNectar) {
         NECTAR_TYPES.forEach((type) => {
           const value = nectar[type];
@@ -414,12 +620,18 @@ app.post("/api/ingest", requireWriteKey, (req, res) => {
           [inserts.map(([metric, tt, vv]) => [req.userKey, metric, tt, vv])]
         );
       }
-      if (typeof currentHoney === "number") {
-        await dbPool.query(
-          "UPDATE users SET current_honey = ?, last_activity = ? WHERE user_key = ?",
-          [currentHoney, t, req.userKey]
-        );
-      }
+
+      const cleanedName = sanitizeUsername(username);
+      await dbPool.query(
+        "UPDATE users SET current_honey = COALESCE(?, current_honey), last_activity = ?, username = COALESCE(?, username) WHERE user_key = ?",
+        [
+          typeof currentHoney === "number" ? currentHoney : null,
+          t,
+          cleanedName,
+          req.userKey
+        ]
+      );
+
       res.json({ ok: true, mode: "mysql" });
     } catch (err) {
       console.error(err);
